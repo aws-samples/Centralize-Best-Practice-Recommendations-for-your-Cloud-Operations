@@ -1,0 +1,22 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Resources:
+  TrustedAdvisorAPIAccess:
+    Type: "AWS::IAM::Role"
+    Properties: 
+      RoleName: "TrustedAdvisorAPIAccessRole"
+      AssumeRolePolicyDocument: 
+        Version: "2012-10-17"
+        Statement: 
+          - Effect: "Allow"
+            Principal: 
+              AWS: "arn:aws:iam::879340939386:root"
+            Action: "sts:AssumeRole"
+      Policies:
+        - PolicyName: "TrustedAdvisorAPIAccess"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: "Allow"
+                Action: 
+                 - "trustedadvisor:List*"
+                Resource: "*"

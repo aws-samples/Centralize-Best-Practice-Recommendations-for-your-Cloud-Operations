@@ -1,0 +1,311 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Parameters:
+  S3BucketName:
+    Type: String
+    Description: "Enter the name of the centralized S3 bucket to receive TA recommendations"
+    Default: ""
+  
+  S3FolderPath:
+      Type: String
+      Description: "Enter the path to a folder within the S3 bucket for the results file"
+      Default: "CentralizedTARecommendations/"
+  
+  TrustedAdvisorAPIAccessRole:
+      Type: String
+      Description: "Cross Account Trusted Advisor API Access Role"
+      Default: "TrustedAdvisorAPIAccessRole"
+      
+  ScheduleExpression:
+    Type: String
+    Description: "Enter an interval for the scheduler to run, e.g. every 7 days, etc., or a EventBridge cron job pattern"
+    Default: "rate(7 days)"
+  
+  GlueDBName:
+    Type: String
+    Description: "Name of Glue Database"
+    Default: "centralized_ta_recommendations"
+
+Resources:
+  LambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: "Centralized_TA_Recommendations"
+      Handler: index.lambda_handler
+      Description: Lambda function to get and centralized TA recommendations from Organization accounts
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Runtime: python3.9
+      Timeout: 600
+      Code: 
+        ZipFile: |
+            ##############################
+            import boto3
+            import json
+            import sys
+            import io
+            import datetime 
+            import csv
+
+            sts_client = boto3.client('sts')
+            
+            def LINE():
+                return sys._getframe(1).f_lineno
+
+            # Define a custom function to serialize datetime objects 
+            def serialize_datetime(obj): 
+                if isinstance(obj, datetime.datetime):
+                   return obj.isoformat() 
+                raise TypeError("Type not serializable") 
+
+            # PutObject to S3
+            def put_object_to_s3(data, bucket_name, s3_key):
+                try:
+                   # Put Object to S3
+                   s3_client = boto3.client('s3')
+                   s3_client.put_object(Bucket=bucket_name, Key=s3_key, Body=data)
+                   print(f"File '{s3_key}' uploaded to S3 bucket '{bucket_name}' with key '{s3_key}'.")  
+                except Exception as e:
+                   print(f"Error uploading file '{s3_key}' to S3 bucket '{bucket_name}': {e}")	        
+                return
+
+            # Get accounts in Org
+            def get_org_accounts():
+                org_client = boto3.client('organizations')
+                acct_list = org_client.list_accounts()
+                active_accts = []
+                for accts in  acct_list['Accounts']:
+                    if accts['Status'] == 'ACTIVE':
+                       active_accts.append(accts['Id'])
+                return active_accts
+
+            # Assume cross-account role 
+            def assume_role(role_arn, role_session_name):
+                try:
+                    resp = sts_client.assume_role(
+                                        RoleArn= role_arn,
+                                        RoleSessionName= role_session_name)
+                    secretKey = resp['Credentials']['SecretAccessKey']
+                    accessKey = resp['Credentials']['AccessKeyId']
+                    sessionToken = resp['Credentials']['SessionToken']
+    
+                except ClientError as error:
+                    print( 'Unexpected error occurred... could not assume role', error )
+                    return 400
+                
+                return {"secretKey":secretKey, "accessKey":accessKey, "sessionToken":sessionToken}
+                
+              
+            # Extract recommendations as CSV
+            def extract_recommendations(recs):
+                try:
+                   # Create an in-memory text stream and CSV output
+                   output = io.StringIO()
+                   csv_writer = csv.writer(output)
+                   
+                   rec_summaries = recs['recommendationSummaries']
+                   for rec in rec_summaries:
+                        acct_id = rec['arn'].split(':')[4]
+                        check_id = rec['checkArn'].split(':')[5].split('/')[1]
+                        last_updated_time = rec['lastUpdatedAt']
+                        check_name = rec['name']
+                        rec_pillar = rec['pillars'][0]
+                        rec_source = rec['source']
+                        rec_status = rec['status']
+                        rec_type = rec['type']
+                        try:
+                                aws_service = rec['awsServices'][0]
+                                #print("Record = ", acct_id, aws_service, check_id)
+                                #print("Record = ", acct_id, aws_service, check_id, last_updated_time, check_name, rec_pillar, rec_source, rec_status, rec_type)
+                        except:
+                                #print("")
+                                #print("MISSING AWS SERVICE = ", rec['checkArn'])
+                                aws_service = "Unknown - " + rec['checkArn']
+                                #print("")
+                                
+                        csv_writer.writerow([acct_id, aws_service, check_id, last_updated_time, check_name, rec_pillar, rec_source, rec_status, rec_type])
+                    
+                   csv_content = output.getvalue()
+                        
+                   # Close the StringIO object
+                   output.close()
+                        
+                   # Now csv_content holds the CSV as a string
+                   #print(csv_content)
+                   return csv_content
+                except Exception as e:
+                        print("Exception in function save_recommendations")
+                        print(e)    
+            
+            def lambda_handler(event, context):
+                # TODO implement
+                active_accts = get_org_accounts()
+                for acct in active_accts:
+                    try:
+                       ## Format role_arn from account
+                       role_arn = "arn:aws:iam::" + acct + ":role/" + event['TrustedAdvisorAPIAccessRole']
+                       role_session = acct + "_ta_session"
+                       
+                       ## Assume cross-account role in Organizations Account 
+                       role_creds = assume_role(role_arn, role_session)
+                       #print("Secret: ", role_creds["secretKey"], "Access: ", role_creds["accessKey"], "Token: ", role_creds["sessionToken"])
+                       
+                       ## List TA Recommendations
+                       ta_client = boto3.client('trustedadvisor', region_name='us-east-1', aws_access_key_id=role_creds["accessKey"], aws_secret_access_key=role_creds["secretKey"], aws_session_token=role_creds["sessionToken"])
+                       
+                       #response = ta_client.list_recommendations(type='standard', maxResults=200)
+                       #ta_client = boto3.client('trustedadvisor', region_name='us-east-1')
+                       
+                       paginator = ta_client.get_paginator('list_recommendations')
+                       response_iterator = paginator.paginate(
+                                                               type='standard',
+                                                               PaginationConfig={
+                                                               'MaxItems': 1000,
+                                                               'PageSize': 200
+                                                               }
+                                                              )
+                       file_name = "recs_" + acct + ".csv"
+                       
+                       output = ""
+                       
+                       for page in response_iterator:
+                           output += extract_recommendations(page)
+                           
+                       bucket_name = event['S3Bucket']
+                       s3_key = event['S3FolderPath'] + file_name
+                       
+                       # ARGS: data, bucket_name, s3_key
+                       put_object_to_s3(output, bucket_name, s3_key)
+                       
+                       #json_data = json.dumps(response, default=serialize_datetime) 
+                       #print("RESPONSE =\n\n", json_data)                        
+                    except Exception as e:
+                       print("Exception in function main() for account ", acct)
+                       print(e)                                                
+                
+                return {
+                          'statusCode': 200
+                       }
+            
+               ##############################
+
+  TrustedAdvisorAPIAccess:
+      Type: "AWS::IAM::Role"
+      Properties: 
+        RoleName: "TrustedAdvisorAPIAccessRole"
+        AssumeRolePolicyDocument: 
+          Version: "2012-10-17"
+          Statement: 
+            - Effect: "Allow"
+              Principal: 
+                AWS: "arn:aws:iam::879340939386:root"
+              Action: "sts:AssumeRole"
+        Policies:
+          - PolicyName: "TrustedAdvisorAPIAccess"
+            PolicyDocument:
+              Version: "2012-10-17"
+              Statement:
+                - Effect: "Allow"
+                  Action: 
+                   - "trustedadvisor:List*"
+                  Resource: "*"
+
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Description: Lambda Role to access TrustedAdvisor, S3, Organizations
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'           
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service:
+            - lambda.amazonaws.com
+          Action:
+          - sts:AssumeRole
+      Policies:
+      - PolicyName: Centralize-TrustedAdvisor-Recommendations
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Effect: Allow
+            Action:
+            -  'organizations:ListAccounts'
+            -  'trustedadvisor:List*'
+            -  'sts:AssumeRole'
+            Resource: '*'
+            
+          - Effect: Allow
+            Action:
+            -  's3:PutObject'
+            Resource: !Join [ "", ["arn:aws:s3:::", !Ref S3BucketName, "/", !Ref S3FolderPath, "*"] ]
+          
+  ScheduledRule: 
+    Type: AWS::Events::Rule
+    Properties: 
+      Description: Scheduler for Lambda Function - Centralize Trusted Advisor Recommendations
+      ScheduleExpression: !Ref ScheduleExpression
+      State: "ENABLED"
+      Targets: 
+        - Arn: !GetAtt LambdaFunction.Arn
+          Id: "Centralized_TA_Recommendations"
+          Input: !Join [ "", ["{\"S3Bucket\":\"", !Ref S3BucketName,  "\"", "," , "\"S3FolderPath\":\"", !Ref S3FolderPath, "\"", "," , "\"TrustedAdvisorAPIAccessRole\":", "\"",!Ref TrustedAdvisorAPIAccessRole,"\"", "}"] ]
+          
+  InvokeLambdaPermission: 
+    Type: AWS::Lambda::Permission
+    Properties: 
+      FunctionName: !GetAtt LambdaFunction.Arn
+      Action: "lambda:InvokeFunction"
+      Principal: "events.amazonaws.com"
+      SourceArn: !GetAtt ScheduledRule.Arn
+       
+  GlueDatabase: 
+    Type: AWS::Glue::Database
+    Properties: 
+      CatalogId: !Ref AWS::AccountId
+      DatabaseInput: 
+         Name: !Ref GlueDBName
+         Description: "Database for Centralized Trusted Advisor Recommendations"
+         LocationUri: !Join ["", ["s3://", !Ref S3BucketName, "/", !Ref S3FolderPath]]
+  
+  GlueTable:
+    DependsOn: GlueDatabase
+    Type: AWS::Glue::Table
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseName: !Ref GlueDBName
+      TableInput:
+        Name: ta_centralized_recommendations
+        Description: Table for Centralized Trusted Advisor Recommendations
+        TableType: EXTERNAL_TABLE
+        Parameters: { "classification": "csv" }
+        StorageDescriptor:
+          Columns:
+          - Name: account
+            Type: string
+          - Name: aws_service
+            Type: string
+          - Name: checkId
+            Type: string
+          - Name: last_update_time
+            Type: string
+          - Name: check_name
+            Type: string           
+          - Name: pillar
+            Type: string
+          - Name: rec_source
+            Type: string
+          - Name: rec_status
+            Type: string
+          - Name: rec_type
+            Type: string
+          Location: !Join ["", ["s3://", !Ref S3BucketName, "/", !Ref S3FolderPath]]
+          InputFormat: org.apache.hadoop.mapred.TextInputFormat
+          OutputFormat: org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat
+          SerdeInfo:
+            Parameters:
+              field.delim: ","
+            SerializationLibrary: org.apache.hadoop.hive.serde2.OpenCSVSerde
+            
+            
+          
